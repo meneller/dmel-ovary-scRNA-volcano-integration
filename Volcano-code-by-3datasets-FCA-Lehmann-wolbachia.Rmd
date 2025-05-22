@@ -1,0 +1,864 @@
+---
+title: "Data mining of 3 different SCrna-seq in drosophila melanogaster ovary"
+author: "Oscar Mendoza"
+date: "2025-05-21"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(ggrepel)
+library(SeuratDisk)
+library(glmGamPoi)
+library(openxlsx)
+library(dplyr)
+```
+
+# Read the data extracted from the article: <https://genome.cshlp.org/content/31/10/1938.full>
+
+```{r}
+load("C:/single_cell_fly/Lehmann-2/GSE162192_Seurat_objects.RData")
+FC_clusters.update  = UpdateSeuratObject(object = FC_clusters) # this command is used to update the information in .Rdata and make it readable to start analyzing the already processed sequencing data.
+
+#Here you plot the umap to be sure it is the umap we will use in the analysis, as the data has 2 additional umaps. our focus is on follicular cells.
+DimPlot(
+  FC_clusters.update,
+  reduction = "umap",
+  label     = TRUE,
+  pt.size   = 1
+)
+
+#The following code copies the annotations found in ident, since it is not defined in .Rdata
+ann_leh <- Idents(FC_clusters.update)
+
+FC_clusters.update <- AddMetaData(
+  FC_clusters.update,
+  metadata = ann_leh,
+  col.name = "annotation_leh"
+)
+
+head(FC_clusters.update[[]])
+Idents(FC_clusters.update) <- "annotation_leh"
+```
+
+```{r volcano_plot_Lehmann, fig.height=8, fig.width=9, fig.align='center'}
+# These are the names of the annotations in Main body Follicular cells
+
+#  St2-4 I  St2-4 II  MB St5-6    MB St6   MB St7    MB St8  MB St8-9    MB St9 
+#     1213      1126      1679       165     1881       938      1653      1015
+# ──────────────────────────────────────────────────────────────────────────
+# 0)  Choose the two composite groups you want to compare
+# ──────────────────────────────────────────────────────────────────────────
+early_stages <- c("St2-4 I", "St2-4 II", "MB St5-6", "MB St6")
+late_stages  <- c("MB St7","MB St8", "MB St8-9", "MB St9")
+
+label_up_early <- "High expressed in St. 2-6"
+label_up_late  <- "High expressed in St. 7-9"
+
+expr_cut <- 0        # keep genes whose *mean* log-expr ≥ 0.05 in BOTH blocks
+pseudo   <- 0         # pseudocount for log2FC
+EPS      <- .Machine$double.xmin       # floor for adjusted p-values
+
+# Generate ‘safe’ file names
+safe1 <- gsub("[^[:alnum:]]+", "_", label_up_late)
+safe2 <- gsub("[^[:alnum:]]+", "_", label_up_early)
+base  <- paste0(safe1, "_vs_", safe2)
+
+# Dynamic labels
+label_up1 <- paste0("High expressed in ", label_up_late)
+label_up2 <- paste0("High expressed in ", label_up_early)
+
+# ──────────────────────────────────────────────────────────────────────────
+# 1)  Pull raw data for each block
+# ──────────────────────────────────────────────────────────────────────────
+DefaultAssay(FC_clusters.update) <- "RNA"
+
+cells_early <- WhichCells(FC_clusters.update, idents = early_stages)
+cells_late  <- WhichCells(FC_clusters.update, idents = late_stages)
+
+expr_mat <- GetAssayData(FC_clusters.update, assay = "RNA", layer = "counts")
+g_early  <- expr_mat[, cells_early, drop = FALSE]
+g_late   <- expr_mat[, cells_late,  drop = FALSE]
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2)  SINGLE filter: mean expression ≥ expr_cut in BOTH blocks
+# ──────────────────────────────────────────────────────────────────────────
+keep <- (rowMeans(g_early) >= expr_cut) |
+        (rowMeans(g_late)  >= expr_cut)
+
+g_early <- g_early[keep, , drop = FALSE]
+g_late  <- g_late[keep, , drop = FALSE]
+genes_use <- rownames(g_early)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 3)  Welch t-test loop
+# ──────────────────────────────────────────────────────────────────────────
+n <- length(genes_use)
+results <- data.frame(
+  Gene    = genes_use,
+  logFC   = numeric(n),
+  p.value = numeric(n),
+  mean_E  = numeric(n),
+  mean_L  = numeric(n),
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(genes_use)) {
+  g   <- genes_use[i]
+  xE  <- log1p(g_early[g, ])
+  xL  <- log1p(g_late[g,  ])
+  tt  <- t.test(xE, xL)
+  #wt  <- wilcox.test(xE, xL, exact = FALSE)
+  muE <- mean(g_early[g, ])
+  muL <- mean(g_late[g, ])
+
+  results$logFC[i]   <- log2(muE + pseudo) - log2(muL + pseudo)
+  #results$p.value[i] <- wt$p.value
+  results$p.value[i] <- tt$p.value
+  results$mean_E[i]  <- muE
+  results$mean_L[i]  <- muL
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+# 4)  Adjust p-values and annotate
+# ──────────────────────────────────────────────────────────────────────────
+results$adj.p.value   <- pmax(p.adjust(results$p.value, "BH"), EPS)
+results$negLog10AdjP  <- -log10(results$adj.p.value)
+results$negLog10p <- -log10(pmax(results$p.value, EPS))
+
+results$annotation <- ifelse(
+  abs(results$logFC) > 0.58 & results$p.value < 0.05,
+  ifelse(results$logFC > 0, label_up_early, label_up_late),
+  "Not significant"
+)
+
+results$annotation <- factor(
+  results$annotation,
+  levels = c("Not significant", label_up_early, label_up_late)
+)
+
+colors <- setNames(c("black", "blue", "red"), levels(results$annotation))
+
+
+# -------------------------------------------------------------------------
+# 5) Dynamic Volcano Plot and saved as PDF
+# -------------------------------------------------------------------------
+
+p_clean <- ggplot(results, aes(logFC, negLog10p, color = annotation)) +
+  geom_point(alpha = 0.6, size = 2) +
+  scale_color_manual(values = colors) +
+  theme_minimal() +
+  labs(
+    title = sprintf(
+      "Volcano plot: %s vs %s",
+      label_up_early, label_up_late
+    ),
+    subtitle = sprintf("Data source-Slaidina, Maija, et al.(2021): Ovary-Follicle cells"),
+    x  = "Log2 fold change",
+    y  = "-Log10 p-value",
+    caption = "Welch t-test"
+  ) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey") +
+  geom_vline(xintercept = c(-0.58, 0.58),     linetype = "dashed", colour = "grey") +
+  geom_text_repel(
+    data  = subset(results, abs(logFC) > 0.58 & negLog10p > 2),
+    aes(label = Gene),
+    size  = 3,
+    box.padding = 0.3
+  ) +
+  theme(
+    text = element_text(size = 12),
+    legend.position = "top",
+    legend.title    = element_blank()
+  )
+
+# Displayed on screen
+print(p_clean)
+
+# Save to PDF
+ggsave(
+  filename = paste0("volcano_nofilterttest", base, ".pdf"),
+  plot     = p_clean,
+  device   = "pdf",
+  width    = 9,
+  height   = 8,
+  units    = "in"
+)
+
+## -------------------------------------------------------------------------
+## 6) Dynamic Excel export
+## -------------------------------------------------------------------------
+#library(openxlsx)
+#wb <- createWorkbook()
+#
+#for (lbl in levels(results$annotation)) {
+#  sheet <- gsub("[^[:alnum:] ]+", "", lbl)
+#  df    <- subset(results, annotation == lbl)
+#  addWorksheet(wb, sheet)
+#  writeData(wb, sheet, df)
+#}
+#
+#saveWorkbook(
+#  wb,
+#  file      = paste0("results_nofilterttest", base, ".xlsx"),
+#  overwrite = TRUE
+#)
+#
+
+```
+
+```{r}
+# This section of the code focuses on extracting the dataset used to generate the volcanoplot, using different filtrations such as FC >1.5 and Pvalue <0.05 or FC >2 and Pvalue <0.01.
+
+# ---- Adjust these thresholds according to your previous script ----
+logfc_thr1   <- 1      # |log₂FC| cutoff
+logfc_thr58   <- .58      # |log₂FC| cutoff
+p1_thresh   <- 0.01   # p-value cutoff 1
+p5_thresh   <- 0.05   # p-value cutoff 5
+
+# ---- Generates the two tables ----
+res_p01 <- results %>%
+  mutate(
+    annotation = ifelse(
+      abs(logFC) > logfc_thr1 & p.value < p1_thresh,
+      ifelse(logFC > 0, label_up1, label_up2),
+      "Not significant"
+    )
+  )
+
+res_p05 <- results %>%
+  mutate(
+    annotation = ifelse(
+      abs(logFC) > logfc_thr58 & p.value < p5_thresh,
+      ifelse(logFC > 0, label_up1, label_up2),
+      "Not significant"
+    )
+  )
+
+# ---- Write Excel with two sheets ----
+wb <- createWorkbook()
+addWorksheet(wb, "pvalue_0.01")
+addWorksheet(wb, "pvalue_0.05")
+
+writeData(wb, "pvalue_0.01", res_p01)
+writeData(wb, "pvalue_0.05", res_p05)
+
+saveWorkbook(
+  wb,
+  file      = "Welch_ttest_AllGenes_Lehmann_AnnotatedBy-pvalue-FC.xlsx",
+  overwrite = TRUE
+)
+
+message("📂 Generated: Welch_ttest_AllGenes_Lehmann_AnnotatedBy_3-pvalue.xlsx")
+
+```
+
+```{r}
+# this section gives us statistics of how many genes we get when using different types of cutoff and then verify them with the extracted excel.
+# your results table from before
+# results$adj.p.value, results$logFC
+# make sure there are no NA raw p-values0
+results$p.value[is.na(results$p.value)] <- 1
+
+# thresholds to try (raw p-values now)
+logfc_thrs <- c(0.5, 0.58, 1.0, 1.5, 2.0)
+pval_thrs  <- c(0.01, 0.05)
+
+total_genes <- nrow(results)
+cat(sprintf("Total genes tested: %d\n\n", total_genes))
+
+for (fc in logfc_thrs) {
+  for (pv in pval_thrs) {
+    sig     <- results$p.value < pv
+    upLate  <- sum(sig & results$logFC  >  fc)
+    upEarly <- sum(sig & results$logFC  < -fc)
+    totSig  <- sum(sig)
+    
+    cat(sprintf(
+      "│ |log₂FC| > %.2f & pvalue < %.2f │  Total sig: %4d  │ St 2-6↑: %4d  │ St 7-9↑: %4d │\n",
+      fc, pv, totSig, upLate, upEarly
+    ))
+  }
+  cat(strrep("─", 60), "\n")
+}
+```
+
+# This section focuses on the volcano for Flycellatlas data extracted from: <https://cloud.flycellatlas.org/index.php/s/dyDk9BCg28HgzLk>
+
+```{r , fig.height=8, fig.width=9, fig.align='center'}
+
+# 
+## ------------------------------------------------------------------
+## 0) parameters you can tweak in ONE place
+## ------------------------------------------------------------------
+
+#this data was previously converted from H5ad to h5seurat with seuratdisk.
+
+#flycellatlas
+FCA <- LoadH5Seurat(
+  "C:/single_cell_fly/ovary.h5seurat",
+  images = FALSE
+)
+```
+
+```{r volcano_plot_FCA, fig.height=8, fig.width=9, fig.align='center'}
+FC_clusters.update = UpdateSeuratObject(FCA)
+
+## Selection of developmental stages for statistical comparison.
+
+cluster1 <- "main body follicle cell ca. until St. 5"
+cluster2 <- "central main body follicle cell ca. St. 6-8"
+
+# Before running the analysis, adjust these parameters to define your significance criteria:
+#   • EPS:       Smallest positive double (used to avoid zeros in computations)
+#   • min_pct:   Minimum detection rate per gene (fraction of cells where gene is expressed)
+#   • expr_cut:  Minimum mean-expression threshold
+#   • pseudo:    Pseudocount to add prior to log2 fold-change calculation
+#   • pval_thresh: Raw p-value cutoff for statistical significance
+#   • logfc_thr:   Minimum absolute log2 fold-change threshold
+Idents(FC_clusters.update) <- "annotation"
+EPS         <- .Machine$double.xmin   # ~2.23e-308, smallest positive double
+min_pct     <- 0                      # e.g. 0.01 = gene must be detected in ≥1% of cells
+expr_cut    <- 0                      # mean-expression cutoff (e.g. TPM or normalized counts)
+pseudo      <- 0                      # value added to avoid division by zero in logFC
+pval_thresh <- 0.05                   # raw p-value significance cutoff
+logfc_thr   <- 0.58                   # |log2FC| cutoff (≈1.5-fold change)
+
+# Generate ‘safe’ file names
+safe1 <- gsub("[^[:alnum:]]+", "_", cluster1)
+safe2 <- gsub("[^[:alnum:]]+", "_", cluster2)
+base  <- paste0(safe1, "_vs_", safe2)
+
+# Dynamic labels
+label_up1 <- paste0("High expressed in ", cluster1)
+label_up2 <- paste0("High expressed in ", cluster2)
+
+# -------------------------------------------------------------------------
+# 1) Prepare object and barcodes
+# -------------------------------------------------------------------------
+
+DefaultAssay(FC_clusters.update) <- "RNA"
+
+expr_mat <- GetAssayData(FC_clusters.update, assay = "RNA", layer = "counts")
+
+cells_early <- WhichCells(FC_clusters.update, idents = cluster1)
+cells_late  <- WhichCells(FC_clusters.update, idents = cluster2)
+
+g_early  <- expr_mat[, cells_early, drop = FALSE]
+g_late   <- expr_mat[, cells_late,  drop = FALSE]
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2)  SINGLE filter: mean expression ≥ expr_cut in BOTH blocks
+# ──────────────────────────────────────────────────────────────────────────
+keep <- (rowMeans(g_early) >= expr_cut) |
+        (rowMeans(g_late)  >= expr_cut)
+
+g_early <- g_early[keep, , drop = FALSE]
+g_late  <- g_late[keep, , drop = FALSE]
+genes_use <- rownames(g_early)
+
+# -------------------------------------------------------------------------
+# 3) Empty data.frame
+# -------------------------------------------------------------------------
+n       <- length(genes_use)
+results <- data.frame(
+  Gene       = genes_use,
+  logFC      = numeric(n),
+  p.value    = numeric(n),
+  mean_1     = numeric(n),
+  mean_2     = numeric(n),
+  stringsAsFactors = FALSE
+)
+
+# -------------------------------------------------------------------------
+# 4) Run the Welch t-test
+# -------------------------------------------------------------------------
+for (i in seq_along(genes_use)) {
+  g   <- genes_use[i]
+  x1  <- log1p(g_early[g, ])
+  x2  <- log1p(g_late[g, ])
+  tt  <- t.test(x1, x2)
+  mu1 <- mean(g_early[g, ])
+  mu2 <- mean(g_late[g, ])
+  results$logFC[i]   <- log2(mu1+pseudo) - log2(mu2+pseudo)
+  results$p.value[i] <- tt$p.value
+  results$mean_1[i]  <- mu1
+  results$mean_2[i]  <- mu2
+}
+
+# -------------------------------------------------------------------------
+# 5) p-values adjustment and dynamic annotation
+# -------------------------------------------------------------------------
+results$adj.p.value <- p.adjust(results$p.value, method = "BH")
+results$adj.p.value  <- pmax(results$adj.p.value, EPS)   # replace 0 by EPS
+results$negLog10AdjP <- -log10(results$adj.p.value)
+results$negLog10p <- -log10(pmax(results$p.value, EPS))
+
+results$annotation <- ifelse(
+  abs(results$logFC) > logfc_thr & results$p.value < pval_thresh,
+  ifelse(results$logFC > 0, label_up1, label_up2),
+  "Not significant"
+)
+
+# Ensures factor with levels in desired order
+results$annotation <- factor(
+  results$annotation,
+  levels = c("Not significant", label_up1, label_up2)
+)
+
+# Define color vector based on those levels
+colors <- setNames(
+  c("black", "blue", "red"),
+  levels(results$annotation)
+)
+
+# -------------------------------------------------------------------------
+# 6) Dynamic Volcano Plot and saved as PDF
+# -------------------------------------------------------------------------
+
+p_clean <- ggplot(results, aes(logFC, negLog10p, color=annotation)) +
+  geom_point(alpha=0.6, size=2) +
+  scale_color_manual(values=colors) +
+  theme_minimal() +
+  labs(
+    title = sprintf(
+      "Volcano plot : %s vs %s ", cluster1, cluster2
+    ),
+    subtitle = sprintf(
+      "Data: Ovary Fly Cell Atlas"
+    ),
+    x = "Log2 fold change",
+    y = "-Log10 p-value",
+    caption = "Welch t-test-|log2FC| > 0.58, pvalue < 0.05" 
+  ) +
+  geom_hline(yintercept = -log10(pval_thresh), linetype="dashed", colour="grey") +
+  geom_vline(xintercept = c(-logfc_thr, logfc_thr), linetype="dashed", colour="grey") +
+  geom_text_repel(
+    data = subset(results, abs(logFC) > logfc_thr & p.value < pval_thresh),
+    aes(label = Gene), size = 3, box.padding = 0.3
+  ) +
+  theme(text = element_text(size=12), legend.position="top", legend.title=element_blank())
+
+print(p_clean)
+
+# Guarda en PDF
+ggsave(
+  filename = paste0("volcano_filter0.5-adj.p.value0.05", base, ".pdf"),
+  plot     = p_clean,
+  device   = "pdf",
+  width    = 9,
+  height   = 8,
+  units    = "in"
+)
+
+# -------------------------------------------------------------------------
+# 7) Dynamic Excel export
+# -------------------------------------------------------------------------
+
+#wb <- createWorkbook()
+#
+#for (lbl in levels(results$annotation)) {
+#  # 1) Clears non-alphanumeric characters
+#  sheet <- gsub("[^[:alnum:] ]+", "", lbl)
+#  # 2) Truncate to 31 characters (Excel limit)
+#  sheet <- substr(sheet, 1, 31)
+#  
+#  df <- subset(results, annotation == lbl)
+#  df <- df[order(rownames(df)), ]
+#  
+#  addWorksheet(wb, sheet)
+#  writeData(wb, sheet, df)
+#}
+#
+#saveWorkbook(
+#  wb,
+#  file      = "volcano_results_FCA-0.5-adj.p.value0.05.xlsx",
+#  overwrite = TRUE
+#)
+
+```
+
+```{r}
+
+# ---- Adjust these thresholds according to your previous script ----
+logfc_thr58   <- 0.58      # |log₂FC| cutoff
+logfc_thr1   <- 0.58 
+p01_thresh   <- 0.01   # p-value cutoff 1
+p05_thresh   <- 0.05   # p-value cutoff 5
+
+# ---- Generates the two tables ----
+res_p01 <- results %>%
+  mutate(
+    annotation = ifelse(
+      abs(logFC) > logfc_thr1 & p.value < p01_thresh,
+      ifelse(logFC > 0, label_up1, label_up2),
+      "Not significant"
+    )
+  )
+
+res_p05 <- results %>%
+  mutate(
+    annotation = ifelse(
+      abs(logFC) > logfc_thr58 & p.value < p05_thresh,
+      ifelse(logFC > 0, label_up1, label_up2),
+      "Not significant"
+    )
+  )
+
+# ---- Write Excel with two sheets ----
+wb <- createWorkbook()
+addWorksheet(wb, "pvalue_0.01-LFC1")
+addWorksheet(wb, "pvalue_0.05-LFC0.58")
+
+writeData(wb, "pvalue_0.01-LFC1", res_p01)
+writeData(wb, "pvalue_0.05-LFC0.58", res_p05)
+
+saveWorkbook(
+  wb,
+  file      = "Welch_ttest_AllGenes_FCA_Annotated-LFC.xlsx",
+  overwrite = TRUE
+)
+
+message("📂 Generated: Welch_ttest_AllGenes_FCA_Annotated-annotated.xlsx")
+
+```
+
+```{r}
+# make sure there are no NA raw p-values0
+results$p.value[is.na(results$p.value)] <- 1
+
+# thresholds to try (raw p-values now)
+logfc_thrs <- c(0.5, 0.58, 1.0, 1.5, 2.0)
+pval_thrs  <- c(0.01, 0.05)
+
+total_genes <- nrow(results)
+cat(sprintf("Total genes tested: %d\n\n", total_genes))
+
+for (fc in logfc_thrs) {
+  for (pv in pval_thrs) {
+    sig     <- results$p.value < pv
+    upLate  <- sum(sig & results$logFC  >  fc)
+    upEarly <- sum(sig & results$logFC  < -fc)
+    totSig  <- sum(sig)
+    
+    cat(sprintf(
+      "│ |log₂FC| > %.2f & pvalue < %.2f │  Total sig: %4d  │ St 5↑: %4d  │ St 6-8↑: %4d │\n",
+      fc, pv, totSig, upLate, upEarly
+    ))
+  }
+  cat(strrep("─", 60), "\n")
+}
+```
+
+# The following code was used to extract the volcano plot from an experiment that was performed with the wolbachia infection, for this data was used the control sample called wolbachia uninfected from scRNA-seq, it should be noted that the data is not in the article, so we wrote to the authors who provided the data, the article is: <https://journals.asm.org/doi/10.1128/mbio.01473-24>
+
+```{r umap_wolbachia, fig.height=8, fig.width=9, fig.align='center'}
+
+## ------------------------------------------------------------------
+## 0) parameters you can tweak in ONE place
+## ------------------------------------------------------------------
+pbmc <- readRDS("C:/single_cell_fly/pbmc_anno.rds")
+
+pbmc.update  = UpdateSeuratObject(object = pbmc)
+# Subset only UnF cells
+FC_clusters.update <- subset(pbmc.update, subset = orig.ident == "UnF")
+
+#verification of data
+
+DimPlot(FC_clusters.update, reduction = "umap", label = T) +
+  ggtitle("umap of Drosophila (Uninfected - UnF)")
+
+
+```
+
+```{r}
+# 1) Capture the current active identities (cluster labels) for every cell
+ann_wolb <- Idents(FC_clusters.update)
+
+# 2) Add that vector back into the object’s metadata as a new column called “annotation”
+FC_clusters.update <- AddMetaData(
+  FC_clusters.update,
+  metadata = ann_wolb,
+  col.name = "annotation"
+)
+
+# 3) Peek at the first few rows of the metadata dataframe to confirm “annotation” was added
+head(FC_clusters.update[[]])
+
+# 4) Show that the object’s active identities (Idents) haven’t changed
+Idents(FC_clusters.update)
+
+```
+
+```{r volcano_plot_wolbachia, fig.height=8, fig.width=9, fig.align='center'}
+
+# Define the two groups we want to compare
+cluster1 <- "Stage 2-6"
+cluster2 <- "AT_MB stage 8-9"
+
+# EPS: a very small positive number to avoid zeros when taking logs
+EPS <- .Machine$double.xmin          # ~2.23e-308
+
+# Parameters for filtering (not used here since both are zero)
+min_pct  <- 0    # fraction-of-cells detection filter (0 → no filter)
+expr_cut <- 0    # mean-expression threshold (0 → no filter)
+
+# Pseudocount added before taking log2 fold changes (0 → no pseudocount)
+pseudo    <- 0
+
+# Create filesystem‐safe names by replacing any non-alphanumeric with “_”
+safe1 <- gsub("[^[:alnum:]]+", "_", cluster1)
+safe2 <- gsub("[^[:alnum:]]+", "_", cluster2)
+
+# Combine into a base name for output files
+base  <- paste0(safe1, "_vs_", safe2)
+
+# Build dynamic labels for plotting and annotation
+label_up1 <- paste0("High expressed in ", cluster1)
+label_up2 <- paste0("High expressed in ", cluster2)
+
+# -------------------------------------------------------------------------
+# 1) Prepare object and barcodes
+# -------------------------------------------------------------------------
+
+DefaultAssay(FC_clusters.update) <- "RNA"
+cells1 <- WhichCells(FC_clusters.update, idents = cluster1)
+cells2 <- WhichCells(FC_clusters.update, idents = cluster2)
+
+expr_mat <- GetAssayData(
+  FC_clusters.update,
+  assay = "RNA",
+  layer  = "counts"
+)
+
+g1 <- expr_mat[, cells1, drop = FALSE]  
+g2 <- expr_mat[, cells2, drop = FALSE]
+
+## 2
+## ------------------------------------------------------------------
+## 2
+## ------------------------------------------------------------------
+DefaultAssay(FC_clusters.update) <- "RNA"
+
+cells_early <- WhichCells(FC_clusters.update, idents = cluster1)
+cells_late  <- WhichCells(FC_clusters.update, idents = cluster2)
+
+expr_mat <- GetAssayData(FC_clusters.update, assay = "RNA", layer = "counts")
+g_early  <- expr_mat[, cells_early, drop = FALSE]
+g_late   <- expr_mat[, cells_late,  drop = FALSE]
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2)  SINGLE filter: mean expression ≥ expr_cut in BOTH blocks
+# ──────────────────────────────────────────────────────────────────────────
+keep <- (rowMeans(g_early) >= expr_cut) |
+        (rowMeans(g_late)  >= expr_cut)
+
+g_early <- g_early[keep, , drop = FALSE]
+g_late  <- g_late[keep, , drop = FALSE]
+genes_use <- rownames(g_early)
+
+# -------------------------------------------------------------------------
+# 3) Empty data.frame
+# -------------------------------------------------------------------------
+n       <- length(genes_use)
+results <- data.frame(
+  Gene       = genes_use,
+  logFC      = numeric(n),
+  p.value    = numeric(n),
+  mean_1     = numeric(n),
+  mean_2     = numeric(n),
+  stringsAsFactors = FALSE
+)
+
+# -------------------------------------------------------------------------
+# 4) Run the Welch t-test
+# -------------------------------------------------------------------------
+for (i in seq_along(genes_use)) {
+  g   <- genes_use[i]
+  x1  <- log1p(g1[g, ])
+  x2  <- log1p(g2[g, ])
+  tt  <- t.test(x1, x2)
+  mu1 <- mean(g1[g, ])
+  mu2 <- mean(g2[g, ])
+  results$logFC[i]   <- log2(mu1+pseudo) - log2(mu2+pseudo)
+  results$p.value[i] <- tt$p.value
+  results$mean_1[i]  <- mu1
+  results$mean_2[i]  <- mu2
+}
+
+# -------------------------------------------------------------------------
+# 5) p-values adjustment and dynamic annotation
+# -------------------------------------------------------------------------
+results$adj.p.value <- p.adjust(results$p.value, method = "BH")
+results$adj.p.value  <- pmax(results$adj.p.value, EPS)   # replace 0 by EPS
+results$negLog10AdjP <- -log10(results$adj.p.value)
+results$negLog10p <- -log10(results$p.value)
+
+results$annotation <- ifelse(
+  abs(results$logFC) > 0.58 & results$p.value < 0.05,
+  ifelse(results$logFC > 0, label_up1, label_up2),
+  "Not significant"
+)
+
+# Ensures factor with levels in desired order
+results$annotation <- factor(
+  results$annotation,
+  levels = c("Not significant", label_up1, label_up2)
+)
+
+# Define color vector based on those levels
+colors <- setNames(
+  c("black", "blue", "red"),
+  levels(results$annotation)
+)
+
+# -------------------------------------------------------------------------
+# 6) Dynamic Volcano Plot and saved as PDF
+# -------------------------------------------------------------------------
+
+top_genes <- results %>%
+  filter(abs(logFC) > 0.58, negLog10p > 1.5) %>%
+  arrange(desc(negLog10p)) %>%
+  slice_head(n = 30)
+
+p_clean <- ggplot(results, aes(logFC, negLog10p, color = annotation)) +
+  geom_point(alpha = 0.6, size = 2) +
+  scale_color_manual(values = colors) +
+  theme_minimal() +
+  labs(
+    title = sprintf(
+      "Volcano plot: %s vs %s",
+      cluster1, cluster2
+    ),
+    subtitle = sprintf("Data source - Miao, Yun-heng, et al. (2024): Drosophila ovaries uninfected with Wolbachia"),
+    x  = "Log2 fold change",
+    y  = "-Log10 p-value",
+    caption = "Welch t-test-|log2FC| > 0.58, pvalue < 0.05"
+  ) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey") +
+  geom_vline(xintercept = c(-0.58, 0.58),     linetype = "dashed", colour = "grey") +
+  geom_text_repel(
+    data        = top_genes,
+    aes(label   = Gene),
+    size        = 3,
+    box.padding = 0.3,
+    max.overlaps= 10      # allow up to 10 overlapping tries
+  ) +
+  theme(
+    text = element_text(size = 12),
+    legend.position = "top",
+    legend.title    = element_blank()
+  )
+
+# Displayed on screen
+print(p_clean)
+
+# Save to PDF
+ggsave(
+  filename = paste0("volcano_filter-unf-data", base, ".pdf"),
+  plot     = p_clean,
+  device   = "pdf",
+  width    = 9,
+  height   = 8,
+  units    = "in"
+)
+
+# -------------------------------------------------------------------------
+# 7) Dynamic Excel export
+# -------------------------------------------------------------------------
+
+wb <- createWorkbook()
+
+for (lbl in levels(results$annotation2)) {
+  # 1) Clears non-alphanumeric characters
+  sheet <- gsub("[^[:alnum:] ]+", "", lbl)
+  # 2) Trunca a 31 caracteres (límite de Excel)
+  sheet <- substr(sheet, 1, 31)
+  
+  df <- subset(results, annotation == lbl)
+  df <- df[order(rownames(df)), ]
+  
+  addWorksheet(wb, sheet)
+  writeData(wb, sheet, df)
+}
+
+saveWorkbook(
+  wb,
+  file      = "volcano_results_unf_sheets2-data-wolbachia.xlsx",
+  overwrite = TRUE
+)
+
+```
+
+```{r}
+library(openxlsx)
+library(dplyr)
+
+# ---- Threshold definition ----
+logfc_thr <- c(0.58, 1.0)     # los dos cortes de log₂FC
+pval_thr <- c(0.01, 0.05)     # los dos cortes de p-value
+
+# ---- Create Workbook ----
+wb <- createWorkbook()
+
+# ---- Loop to generate each combination ----
+for (lfc in logfc_thr) {
+  for (pv in pval_thr) {
+    #  Generate sheet name
+    sheet_name <- sprintf("p<%.2f-LFC%.2f", pv, lfc)
+    
+    # Annotate according to thresholds
+    res_annot <- results %>%
+      mutate(
+        annotation = ifelse(
+          abs(logFC) > lfc & p.value < pv,
+          ifelse(logFC > 0, label_up1, label_up2),
+          "Not significant"
+        )
+      )
+    
+    # Add sheet and write data
+    addWorksheet(wb, sheet_name)
+    writeData(wb, sheet_name, res_annot)
+  }
+}
+
+# ---- Save file ----
+out_file <- "Welch_ttest_AllGenes_Wolbachia_Annotated-multiple_LFC.xlsx"
+saveWorkbook(wb, file = out_file, overwrite = TRUE)
+
+message("📂 Generated: ", out_file)
+
+```
+
+```{r}
+# make sure there are no NA raw p-values0
+results$p.value[is.na(results$p.value)] <- 1
+
+# thresholds to try (raw p-values now)
+logfc_thrs <- c(0.5, 0.58, 1.0, 1.5, 2.0)
+pval_thrs  <- c(0.01, 0.05)
+
+total_genes <- nrow(results)
+cat(sprintf("Total genes tested: %d\n\n", total_genes))
+
+for (fc in logfc_thrs) {
+  for (pv in pval_thrs) {
+    sig     <- results$p.value < pv
+    upLate  <- sum(sig & results$logFC  >  fc)
+    upEarly <- sum(sig & results$logFC  < -fc)
+    totSig  <- sum(sig)
+    
+    cat(sprintf(
+      "│ |log₂FC| > %.2f & p < %.2f │  Total sig: %4d  │ St 2-6↑: %4d  │ St 8-9↑: %4d │\n",
+      fc, pv, totSig, upLate, upEarly
+    ))
+  }
+  cat(strrep("─", 60), "\n")
+}
+
+```
